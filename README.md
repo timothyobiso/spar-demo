@@ -1,7 +1,7 @@
 ---
 title: TAM Steering Demo
 sdk: gradio
-sdk_version: 5.4.0
+sdk_version: 6.13.0
 app_file: app.py
 python_version: "3.11"
 pinned: false

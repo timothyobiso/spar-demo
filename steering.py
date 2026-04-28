@@ -345,8 +345,10 @@ class SteeringEngine:
 
 def engine_from_env() -> SteeringEngine:
     """Build a SteeringEngine using env vars so Modal and local share config."""
-    model_name = os.environ.get("STEER_MODEL", "Qwen/Qwen3-4B")
-    probe_path = os.environ.get("STEER_PROBES", "./results/qwen3.5-4b/probes.pkl")
+    model_name = os.environ.get("STEER_MODEL", "Qwen/Qwen3.5-9B-Base")
+    probe_path = os.environ.get(
+        "STEER_PROBES", "./results/qwen3.5-9b-base/probes_caa_v3.pkl"
+    )
     target_layer_env = os.environ.get("STEER_LAYER")
     target_layer = int(target_layer_env) if target_layer_env else None
     mock = os.environ.get("STEER_MOCK", "0") == "1"

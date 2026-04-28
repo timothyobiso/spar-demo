@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.gradio/
+.env
+.DS_Store
+.claude/
+
+# Don't commit the tam Ridge probes — those belong to the separate tam paper
+results/qwen3.5-4b/
+
+# Don't commit raw eval dumps (large, not core deliverables)
+results/eval_*.json
+results/sweep*.json
+
+# Default: no pkls, except the v2/v3 CAA probes we want to publish
+*.pkl
+!results/qwen3.5-9b-base/probes_caa.pkl
+!results/qwen3.5-9b-base/probes_caa_v3.pkl

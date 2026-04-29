@@ -381,6 +381,7 @@ class SteeringEngine:
         top_p: float = 0.9,
         seed: Optional[int] = None,
         steering_vectors: Optional[dict] = None,
+        stop_on_boxed: bool = False,
     ) -> Iterator[str]:
         """Stream text from the model with optional steering.
 
@@ -412,7 +413,8 @@ class SteeringEngine:
                 time.sleep(0.03)
             return
 
-        from transformers import TextIteratorStreamer
+        from transformers import TextIteratorStreamer, StoppingCriteria, StoppingCriteriaList
+        import re as _re
 
         if steering_vectors:
             handles = self._register_hooks_with_vector(steering_vectors)
@@ -433,6 +435,27 @@ class SteeringEngine:
                 streamer=streamer,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
+
+            if stop_on_boxed:
+                _BOXED_PAT = _re.compile(r"\\boxed\{\s*\$?\s*\d+(?:\.\d+)?\s*\}")
+                _prompt_len = inputs["input_ids"].shape[1]
+                _tok = self.tokenizer
+
+                class StopOnBoxed(StoppingCriteria):
+                    def __init__(self):
+                        self._last_check = 0
+
+                    def __call__(self, input_ids, scores, **_kw):
+                        cur_len = input_ids.shape[1]
+                        if cur_len - self._last_check < 4:
+                            return False
+                        self._last_check = cur_len
+                        gen_ids = input_ids[0, _prompt_len:]
+                        text = _tok.decode(gen_ids, skip_special_tokens=True)
+                        return bool(_BOXED_PAT.search(text))
+
+                kwargs["stopping_criteria"] = StoppingCriteriaList([StopOnBoxed()])
+
             thread = threading.Thread(target=self.model.generate, kwargs=kwargs)
             thread.start()
 

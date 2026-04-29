@@ -83,6 +83,11 @@ def build_prompt(stock: dict, horizon: dict, bg_name: str) -> str:
         ticker=stock["ticker"], name=stock["name"],
         sector=stock["sector"], price=stock["approx_price"],
     )
+    # Completion-style "forecast list" prompt. The model has to commit a number
+    # as the very next token after "$" — no room to spiral in <think> blocks
+    # or copy from few-shot examples (we tried boxed/few-shot in iteration; it
+    # invited Qwen-Base to loop or leak example numbers). The first number IS
+    # the answer because the prompt structure forces it.
     return (
         f"{bg}\n\n"
         f"Forecast:\n"

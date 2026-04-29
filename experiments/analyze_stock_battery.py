@@ -21,7 +21,9 @@ import numpy as np
 
 # ----- price extraction ----------------------------------------------------
 
-# First decimal-or-int near the start; tolerates leading $, commas, ranges.
+# Strict: matches \boxed{<number>} or \boxed{$<number>}.
+_BOXED_RE = re.compile(r"\\boxed\{\s*\$?\s*(\d{1,4}(?:,\d{3})*(?:\.\d+)?)\s*\}")
+# Fallback: first decimal-or-int (used when \boxed{} is missing).
 _PRICE_RE = re.compile(r"\$?\s*(\d{1,4}(?:,\d{3})*(?:\.\d+)?)")
 _PERIOD_TOKENS = {
     "tonight":   ["tonight"],
@@ -33,20 +35,31 @@ _PERIOD_TOKENS = {
 }
 
 
-def extract_price(text: str) -> float | None:
-    """First numeric value (treated as a price). Strips $ and commas."""
-    m = _PRICE_RE.search(text or "")
-    if not m:
-        return None
-    s = m.group(1).replace(",", "")
+def _try(s: str) -> float | None:
     try:
-        v = float(s)
-        # Sanity: stock prices in [0.01, 100000]; otherwise probably a token like "2025"
-        if 0.01 <= v <= 100000:
-            return v
-        return None
+        v = float(s.replace(",", ""))
+        return v if 0.01 <= v <= 100000 else None
     except ValueError:
         return None
+
+
+def extract_price(text: str) -> tuple[float | None, str]:
+    """Try \\boxed{} first, fall back to first sensible number.
+
+    Returns (price, source) where source ∈ {"boxed", "first", "none"}.
+    """
+    text = text or ""
+    m = _BOXED_RE.search(text)
+    if m:
+        v = _try(m.group(1))
+        if v is not None:
+            return v, "boxed"
+    m = _PRICE_RE.search(text)
+    if m:
+        v = _try(m.group(1))
+        if v is not None:
+            return v, "first"
+    return None, "none"
 
 
 def mention_flags(text: str) -> dict[str, bool]:
@@ -64,7 +77,9 @@ def load_records(path: Path) -> list[dict]:
             if not line:
                 continue
             r = json.loads(line)
-            r["price_pred"] = extract_price(r["generation"])
+            price, source = extract_price(r["generation"])
+            r["price_pred"] = price
+            r["price_source"] = source
             cur = r["stock"]["approx_price"]
             r["ratio"] = (r["price_pred"] / cur) if r["price_pred"] else None
             r["mentions"] = mention_flags(r["generation"])
@@ -272,8 +287,11 @@ def main():
     print(f"[analyze] loading {inp}")
     records = load_records(inp)
     n_extracted = sum(1 for r in records if r["price_pred"] is not None)
+    n_boxed = sum(1 for r in records if r.get("price_source") == "boxed")
+    n_first = sum(1 for r in records if r.get("price_source") == "first")
     print(f"[analyze] {len(records)} records, {n_extracted} with extractable price "
           f"({100*n_extracted/max(1,len(records)):.1f}%)")
+    print(f"[analyze]   sourced from boxed: {n_boxed}  · fallback first-number: {n_first}")
 
     write_summary_csv(records, out_dir)
     plot_steering_by_horizon(records, out_dir)

@@ -66,6 +66,10 @@ def discover_probes(
     for setname, by_target in probes.items():
         if not isinstance(by_target, dict):
             continue
+        if setname == "continuous":
+            # Continuous regression probes are loaded separately for Mode 3,
+            # not exposed as per-period sliders.
+            continue
         for target, by_layer in by_target.items():
             if not isinstance(by_layer, dict):
                 continue
@@ -192,6 +196,54 @@ class SteeringEngine:
             print(f"[engine] no probes at {probe_path}; running with 0 features")
             self.probes = []
 
+        # Continuous probe (Mode 3) — optional, loaded separately.
+        self.continuous_direction: Optional[torch.Tensor] = None
+        self.continuous_layer: Optional[int] = None
+        self.continuous_w_norm: float = 0.0
+        self.continuous_intercept: float = 0.0
+
+    def load_continuous_probe(self, probe_path: str, prefer_layer: Optional[int] = None) -> bool:
+        """Load Mode-3 continuous regression probe from a probes_continuous_*.pkl.
+
+        Picks the layer closest to ``prefer_layer`` (or the highest layer present).
+        Returns True on success.
+        """
+        if self.mock:
+            return False
+        path = Path(probe_path)
+        if not path.exists():
+            print(f"[engine] no continuous probe at {probe_path}")
+            return False
+        with open(path, "rb") as f:
+            blob = pickle.load(f)
+        try:
+            by_layer = blob["continuous"]["log_time_horizon"]
+        except (KeyError, TypeError):
+            print(f"[engine] {probe_path} doesn't have continuous/log_time_horizon")
+            return False
+
+        layers = sorted(int(l) for l in by_layer.keys())
+        if not layers:
+            return False
+        if prefer_layer is not None:
+            layer = min(layers, key=lambda l: abs(l - int(prefer_layer)))
+        else:
+            layer = max(layers)
+        entry = by_layer[layer]
+
+        import torch as _torch
+        w = np.asarray(entry["direction"], dtype=np.float32)
+        w_norm = float(np.linalg.norm(w))
+        unit = (w / w_norm) if w_norm > 0 else w
+        self.continuous_direction = _torch.tensor(unit, dtype=self._dtype).to(self._device)
+        self.continuous_layer = int(layer)
+        self.continuous_w_norm = w_norm
+        self.continuous_intercept = float(entry.get("intercept", 0.0))
+        r2 = entry.get("r2_train", "?")
+        print(f"[engine] continuous probe@L{layer}: ||w||={w_norm:.2f}, "
+              f"R²train={r2 if isinstance(r2, str) else f'{r2:.3f}'}")
+        return True
+
     def _blocks(self):
         m = self.model
         if hasattr(m, "model") and hasattr(m.model, "layers"):
@@ -199,6 +251,79 @@ class SteeringEngine:
         if hasattr(m, "transformer") and hasattr(m.transformer, "h"):
             return m.transformer.h
         raise RuntimeError("Could not locate decoder layer stack on model")
+
+    # ------- Mode 2 / Mode 3 steering-vector builders ------------------------
+
+    PERIOD_ORDER = ["tonight", "tomorrow", "one_week", "one_month", "one_year", "a_decade"]
+
+    def ordered_period_probes(self) -> list:
+        """Return Mode-1 CAA probes in canonical earliest→latest order."""
+        by_target = {p.target: p for p in self.probes}
+        return [by_target[t] for t in self.PERIOD_ORDER if t in by_target]
+
+    def vec_interp(self, time_pos: float, strength: float):
+        """Mode 2: piecewise-linear blend across the 6 CAA probes.
+
+        time_pos in [0, N-1]: 0=tonight, N-1=a_decade. Direction is the
+        unit-normalized blend; magnitude is ``strength``.
+        Returns dict[layer -> torch.Tensor].
+        """
+        probes = self.ordered_period_probes()
+        if not probes:
+            return {}
+        n = len(probes)
+        t = max(0.0, min(float(n - 1), float(time_pos)))
+        lo = int(t)
+        hi = min(lo + 1, n - 1)
+        frac = t - lo
+        blend = (1.0 - frac) * probes[lo].direction + frac * probes[hi].direction
+        norm = blend.norm()
+        if float(norm) > 0:
+            blend = blend / norm
+        layer = probes[0].layer
+        return {layer: blend * float(strength)}
+
+    def vec_continuous(self, time_pos: float, strength: float):
+        """Mode 3: continuous probe direction × signed time × strength.
+
+        time_pos in [0, 5]: 0=tonight, 5=decade, center 2.5 → no steering.
+        signed = (time_pos - 2.5) / 2.5  ∈ [-1, +1].
+        Returns dict[layer -> torch.Tensor].
+        """
+        if self.continuous_direction is None or self.continuous_layer is None:
+            return {}
+        signed = (float(time_pos) - 2.5) / 2.5
+        return {self.continuous_layer: self.continuous_direction * signed * float(strength)}
+
+    def _register_hooks_with_vector(self, by_layer: dict) -> list:
+        """Register forward hooks given precomputed per-layer steering vectors."""
+        handles = []
+        blocks = self._blocks()
+        for layer_idx, vec in by_layer.items():
+            if not (0 <= int(layer_idx) < self.n_layers):
+                continue
+            try:
+                if float(vec.norm().item()) < 1e-8:
+                    continue
+            except Exception:
+                pass
+            module = blocks[int(layer_idx)]
+            try:
+                dev = next(module.parameters()).device
+            except StopIteration:
+                dev = next(self.model.parameters()).device
+            v = vec.to(device=dev)
+
+            def make_hook(v_local):
+                def hook(_module, _inputs, outputs):
+                    if isinstance(outputs, tuple):
+                        hidden = outputs[0] + v_local.to(outputs[0].dtype)
+                        return (hidden,) + outputs[1:]
+                    return outputs + v_local.to(outputs.dtype)
+                return hook
+
+            handles.append(module.register_forward_hook(make_hook(v)))
+        return handles
 
     def _register_hooks(self, alphas: dict[str, float]):
         # STEER_SPREAD="-2,0,2" → also hook layers L-2 and L+2 for each probe.
@@ -251,23 +376,36 @@ class SteeringEngine:
         self,
         prompt: str,
         max_new_tokens: int,
-        alphas: dict[str, float],
+        alphas: Optional[dict[str, float]] = None,
         temperature: float = 0.8,
         top_p: float = 0.9,
         seed: Optional[int] = None,
+        steering_vectors: Optional[dict] = None,
     ) -> Iterator[str]:
+        """Stream text from the model with optional steering.
+
+        Provide either ``alphas`` (Mode 1, per-probe scaling with STEER_SPREAD
+        spread) or ``steering_vectors`` (Modes 2/3, precomputed per-layer
+        tensors). If both are None/empty, generates baseline output.
+        """
         if seed is not None:
             import torch as _torch
             _torch.manual_seed(int(seed))
         if self.mock:
             import time
-            nonzero = {k: v for k, v in alphas.items() if v}
-            header = f"[mock α={nonzero}] " if nonzero else "[mock baseline] "
+            tag = ""
+            if steering_vectors:
+                tag = "[mock vec] "
+            elif alphas:
+                nonzero = {k: v for k, v in alphas.items() if v}
+                tag = f"[mock α={nonzero}] " if nonzero else "[mock baseline] "
+            else:
+                tag = "[mock baseline] "
             filler = (
                 "the chef carefully considered the ingredients on hand and began to "
                 "plan the evening menu with an eye toward timing and prep order "
             ).split()
-            acc = header
+            acc = tag
             for i in range(min(max_new_tokens, 120)):
                 acc += filler[i % len(filler)] + " "
                 yield acc
@@ -276,7 +414,10 @@ class SteeringEngine:
 
         from transformers import TextIteratorStreamer
 
-        handles = self._register_hooks(alphas)
+        if steering_vectors:
+            handles = self._register_hooks_with_vector(steering_vectors)
+        else:
+            handles = self._register_hooks(alphas or {})
         try:
             input_device = next(self.model.parameters()).device
             inputs = self.tokenizer(prompt, return_tensors="pt").to(input_device)
@@ -366,10 +507,17 @@ def engine_from_env() -> SteeringEngine:
         "a_decade": "A Decade",
     }
 
-    return SteeringEngine(
+    engine = SteeringEngine(
         model_name=model_name,
         probe_path=probe_path,
         mock=mock,
         target_layer=target_layer,
         display_names=display_names,
     )
+    cont_path = os.environ.get(
+        "STEER_PROBES_CONTINUOUS",
+        "./results/qwen3.5-9b-base/probes_continuous_v3.pkl",
+    )
+    if not mock:
+        engine.load_continuous_probe(cont_path, prefer_layer=target_layer)
+    return engine

@@ -17,3 +17,11 @@ results/sweep*.json
 *.pkl
 !results/qwen3.5-9b-base/probes_caa.pkl
 !results/qwen3.5-9b-base/probes_caa_v3.pkl
+!results/qwen3.5-9b-base/probes_continuous_v3.pkl
+
+# Don't commit slides (separate deliverable)
+slides/
+
+# Don't commit experiment battery raw outputs (large, easy to regenerate)
+results/stock_battery_*.jsonl
+results/stock_battery_figs/

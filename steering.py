@@ -469,6 +469,75 @@ class SteeringEngine:
                 h.remove()
 
 
+    def read_probe_trajectory(
+        self,
+        text: str,
+        layer: Optional[int] = None,
+        extra_directions: Optional[Any] = None,
+    ) -> dict:
+        """Forward-pass ``text``, capture residuals at ``layer`` for every token,
+        and project onto the continuous probe direction.
+
+        ``extra_directions`` may be a (K, d) torch tensor of additional unit
+        directions (e.g., random controls). Their projections are returned
+        as ``extra_projections`` of shape (K, T).
+
+        Returns dict with keys:
+            input_ids, tokens, offsets, projection, predicted_log_days,
+            layer, extra_projections (if extra_directions given)
+
+        Layer defaults to ``self.continuous_layer``. Requires the continuous
+        probe to be loaded (load_continuous_probe).
+        """
+        if self.mock or self.continuous_direction is None:
+            raise RuntimeError("read_probe_trajectory needs a continuous probe loaded")
+
+        import torch as _torch
+        L = int(layer) if layer is not None else int(self.continuous_layer)
+        if not (0 <= L < self.n_layers):
+            raise ValueError(f"layer {L} out of range")
+
+        captures: dict[str, _torch.Tensor] = {}
+        blocks = self._blocks()
+
+        def hook(_m, _i, outputs):
+            x = outputs[0] if isinstance(outputs, tuple) else outputs
+            captures["res"] = x.squeeze(0).detach()  # (T, d)
+
+        h = blocks[L].register_forward_hook(hook)
+        try:
+            input_device = next(self.model.parameters()).device
+            enc = self.tokenizer(
+                text, return_tensors="pt", return_offsets_mapping=True,
+            )
+            offsets = enc.pop("offset_mapping")[0].tolist()
+            enc = {k: v.to(input_device) for k, v in enc.items()}
+            with _torch.no_grad():
+                self.model(**enc)
+        finally:
+            h.remove()
+
+        res = captures["res"].float()  # (T, d)
+        direction = self.continuous_direction.float()
+        proj = (res @ direction).cpu().numpy()
+        pred_logd = self.continuous_w_norm * proj + self.continuous_intercept
+
+        ids = enc["input_ids"][0].cpu().numpy()
+        toks = self.tokenizer.convert_ids_to_tokens(ids.tolist())
+        out = {
+            "input_ids": ids,
+            "tokens": toks,
+            "offsets": offsets,
+            "projection": proj,
+            "predicted_log_days": pred_logd,
+            "layer": L,
+        }
+        if extra_directions is not None:
+            extras = extra_directions.float()  # (K, d)
+            extra_proj = (extras @ res.T).cpu().numpy()  # (K, T)
+            out["extra_projections"] = extra_proj
+        return out
+
     def read_probes(self, prompt: str) -> dict[str, float]:
         """Project the last-token activation at each probe's layer onto its direction.
 

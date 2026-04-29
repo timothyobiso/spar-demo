@@ -209,10 +209,107 @@ def plot_aggregate(records: list[dict], out_path: Path):
     }
 
 
+def plot_per_class(records: list[dict], out_path: Path):
+    """Per-class projection: median ± IQR per horizon. Tests separability."""
+    pairs = collect_pairs(records)
+    if not pairs:
+        return None
+
+    # Per-prompt aggregation (one point per generation, not per sentence).
+    # Averages out within-section noise where many sentences are generic filler.
+    by_trace: dict[str, list[float]] = {}
+    by_trace_horizon: dict[str, str] = {}
+    for r in records:
+        gen_pairs = [s for s in r["sentences"]
+                     if (not s.get("in_prompt"))
+                     and s["horizon_log_days"] is not None
+                     and s["proj_mean"] is not None]
+        if not gen_pairs:
+            continue
+        key = f"{r['id']}/{r.get('seed', 0)}"
+        by_trace[key] = [s["proj_mean"] for s in gen_pairs]
+        # All sentences in an anchored gen share the same horizon
+        by_trace_horizon[key] = gen_pairs[0]["horizon_primary"]
+
+    # ----- Plot 1: per-sentence violins -----
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    sent_by_h: dict[str, list[float]] = {h: [] for h in HORIZON_ORDER}
+    for p in pairs:
+        if p["horizon"] in sent_by_h:
+            sent_by_h[p["horizon"]].append(p["proj_mean"])
+    data1 = [sent_by_h[h] for h in HORIZON_ORDER]
+    parts1 = ax1.violinplot(data1, positions=range(len(HORIZON_ORDER)),
+                            showmedians=True, widths=0.85)
+    for i, body in enumerate(parts1["bodies"]):
+        body.set_facecolor(HORIZON_COLORS[HORIZON_ORDER[i]])
+        body.set_alpha(0.7)
+    ax1.set_xticks(range(len(HORIZON_ORDER)))
+    ax1.set_xticklabels(HORIZON_ORDER, rotation=20, ha="right", fontsize=8)
+    ax1.set_ylabel("probe projection (per sentence)")
+    ax1.axhline(0, color="black", linewidth=0.4, alpha=0.4)
+    ax1.set_title(f"Per-sentence (n={sum(len(v) for v in data1)})")
+
+    # ----- Plot 2: per-trace means (one dot per generation) -----
+    trace_by_h: dict[str, list[float]] = {h: [] for h in HORIZON_ORDER}
+    for k, projs in by_trace.items():
+        h = by_trace_horizon[k]
+        if h in trace_by_h:
+            trace_by_h[h].append(float(np.mean(projs)))
+    data2 = [trace_by_h[h] for h in HORIZON_ORDER]
+    bp = ax2.boxplot(data2, positions=range(len(HORIZON_ORDER)),
+                     patch_artist=True, widths=0.6)
+    for i, box in enumerate(bp["boxes"]):
+        box.set_facecolor(HORIZON_COLORS[HORIZON_ORDER[i]])
+        box.set_alpha(0.7)
+    # overlay individual trace means as dots
+    for i, vals in enumerate(data2):
+        jitter = (np.random.default_rng(i).standard_normal(len(vals)) * 0.07)
+        ax2.scatter(np.full(len(vals), i) + jitter, vals,
+                    color="black", s=18, alpha=0.6, zorder=10)
+    ax2.set_xticks(range(len(HORIZON_ORDER)))
+    ax2.set_xticklabels(HORIZON_ORDER, rotation=20, ha="right", fontsize=8)
+    ax2.set_ylabel("mean probe projection (per generation)")
+    ax2.axhline(0, color="black", linewidth=0.4, alpha=0.4)
+    ax2.set_title(f"Per-generation (n={sum(len(v) for v in data2)})")
+
+    fig.suptitle("Probe projection by horizon class — sentence vs. generation aggregation")
+    plt.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] wrote {out_path}")
+
+    # Print class medians for the eyeball test
+    print(f"[plot]   per-generation medians (proj):")
+    for h in HORIZON_ORDER:
+        vals = trace_by_h[h]
+        if vals:
+            print(f"[plot]     {h:>10s}: median={float(np.median(vals)):+.3f}  "
+                  f"n={len(vals)}")
+
+    # ----- Per-generation Spearman (cleaner signal) -----
+    flat_proj, flat_h = [], []
+    for k, projs in by_trace.items():
+        h = by_trace_horizon[k]
+        flat_proj.append(float(np.mean(projs)))
+        flat_h.append(HORIZON_LOG_DAYS_MAP[h])
+    rho_gen, p_gen = spearman(np.array(flat_proj), np.array(flat_h))
+    print(f"[plot]   per-generation Spearman: ρ={rho_gen:+.3f} (p≈{p_gen:.2g}, n={len(flat_proj)})")
+    return {"per_gen_rho": rho_gen, "per_gen_n": len(flat_proj)}
+
+
+HORIZON_LOG_DAYS_MAP = {
+    "tonight":   -0.602, "tomorrow":   0.000, "one_week":   0.845,
+    "one_month":  1.477, "one_year":   2.562, "a_decade":   3.562,
+}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--in", dest="inp", required=True)
     p.add_argument("--out-dir", default="results/probe_traj_figs")
+    p.add_argument("--no-sparklines", action="store_true",
+                   help="skip per-trace sparklines (faster for large runs)")
     args = p.parse_args()
 
     records = load(Path(args.inp))
@@ -220,11 +317,13 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[plot] loaded {len(records)} traces from {args.inp}")
 
-    for r in records:
-        slug = r["id"].replace("/", "__")
-        plot_sparkline(r, out_dir / f"sparkline_{slug}.png")
+    if not args.no_sparklines:
+        for r in records:
+            slug = r["id"].replace("/", "__")
+            plot_sparkline(r, out_dir / f"sparkline_{slug}.png")
 
     plot_aggregate(records, out_dir / "aggregate_tracking.png")
+    plot_per_class(records, out_dir / "per_class_separation.png")
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ from steering import engine_from_env
 # Pilot prompts. Mix of two kinds:
 #   forced/* — explicit horizon scaffolding; signal MUST be present if probe works
 #   free/*   — open-ended planning; tests whether horizons emerge and probe tracks
-PROMPTS = [
+PROMPTS_REGEX = [
     {
         "id": "forced/launch",
         "kind": "forced",
@@ -84,6 +84,42 @@ PROMPTS = [
         ),
     },
 ]
+
+
+# Anchored prompts: each prompt seeds a specific horizon via header. Every
+# sentence the model generates inherits that horizon as ground-truth label.
+# Domain × horizon → 5 × 6 = 30 prompts. Tighter signal, far more N.
+_ANCHOR_DOMAINS = [
+    ("surgery", "Plan how to recover after a major surgery."),
+    ("startup", "Plan how to launch a successful technology startup."),
+    ("career",  "Advise a recent college graduate planning their career."),
+    ("climate", "Help a city government plan its response to climate change."),
+    ("fitness", "Design a fitness plan for someone starting from scratch."),
+]
+_ANCHOR_HEADERS = [
+    ("tonight",   "Tonight, the most important thing is to"),
+    ("tomorrow",  "Tomorrow morning, the priorities are to"),
+    ("one_week",  "Over the next week, the focus is to"),
+    ("one_month", "By next month, the goal is to"),
+    ("one_year",  "Within the next year, the aim is to"),
+    ("a_decade",  "A decade from now, looking back, the most important step was to"),
+]
+
+
+def _build_anchored_prompts() -> list[dict]:
+    out = []
+    for dom_id, dom_text in _ANCHOR_DOMAINS:
+        for horizon, header in _ANCHOR_HEADERS:
+            out.append({
+                "id": f"anchored/{dom_id}/{horizon}",
+                "kind": "anchored",
+                "horizon": horizon,
+                "text": f"{dom_text}\n\n{header}",
+            })
+    return out
+
+
+PROMPTS_ANCHORED = _build_anchored_prompts()
 
 
 # ---------------- sentence segmentation -------------------------------------
@@ -203,86 +239,107 @@ def run(args):
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    prompts = PROMPTS
+    if args.prompts == "regex":
+        prompts = PROMPTS_REGEX
+    elif args.prompts == "anchored":
+        prompts = PROMPTS_ANCHORED
+    elif args.prompts == "both":
+        prompts = PROMPTS_REGEX + PROMPTS_ANCHORED
+    else:
+        raise ValueError(f"unknown --prompts {args.prompts}")
     if args.prompt_filter:
         prompts = [p for p in prompts if args.prompt_filter in p["id"]]
-    print(f"[traj] running {len(prompts)} prompts × seed {args.seed}, max_new={args.max_tokens}")
+    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+    total = len(prompts) * len(seeds)
+    print(f"[traj] running {len(prompts)} prompts × {len(seeds)} seeds = {total} gens, "
+          f"max_new={args.max_tokens}")
 
     with open(out_path, "w") as fout:
-        for pi, prompt_spec in enumerate(prompts, 1):
-            print(f"\n[traj] [{pi}/{len(prompts)}] {prompt_spec['id']}")
-            prompt = prompt_spec["text"]
+        gi = 0
+        for prompt_spec in prompts:
+            for seed in seeds:
+                gi += 1
+                print(f"\n[traj] [{gi}/{total}] {prompt_spec['id']} seed={seed}")
+                prompt = prompt_spec["text"]
 
-            # 1. Generate
-            generation = ""
-            for chunk in engine.generate_stream(
-                prompt, args.max_tokens,
-                temperature=args.temp, top_p=args.top_p,
-                seed=args.seed, alphas={},
-            ):
-                generation = chunk
-            full = prompt + generation
+                # 1. Generate
+                generation = ""
+                for chunk in engine.generate_stream(
+                    prompt, args.max_tokens,
+                    temperature=args.temp, top_p=args.top_p,
+                    seed=seed, alphas={},
+                ):
+                    generation = chunk
+                full = prompt + generation
 
-            # 2. Read trajectory across full text (probe + random controls)
-            traj = engine.read_probe_trajectory(full, layer=layer, extra_directions=rand_dirs)
-            offsets = traj["offsets"]
-            proj = traj["projection"].astype(float).tolist()
-            pred = traj["predicted_log_days"].astype(float).tolist()
-            ctrl_proj = traj["extra_projections"].astype(float)  # (K, T)
+                # 2. Read trajectory across full text (probe + random controls)
+                traj = engine.read_probe_trajectory(full, layer=layer, extra_directions=rand_dirs)
+                offsets = traj["offsets"]
+                proj = traj["projection"].astype(float).tolist()
+                pred = traj["predicted_log_days"].astype(float).tolist()
+                ctrl_proj = traj["extra_projections"].astype(float)  # (K, T)
 
-            # 3. Sentence segment (over the WHOLE text — prompt + generation)
-            sentences = split_into_sentences(full)
-            sent_records = []
-            prompt_end = len(prompt)
-            for si, (cs, ce, txt) in enumerate(sentences):
-                t_lo, t_hi = tokens_in_span(offsets, cs, ce)
-                if t_lo < 0:
-                    continue
-                seg_proj = proj[t_lo:t_hi]
-                seg_pred = pred[t_lo:t_hi]
-                seg_ctrl = ctrl_proj[:, t_lo:t_hi]  # (K, seg_len)
-                primary, all_matched = label_sentence(txt)
-                sent_records.append({
-                    "idx": si,
-                    "text": txt,
-                    "char_range": [cs, ce],
-                    "tok_range": [t_lo, t_hi],
-                    "in_prompt": ce <= prompt_end,
-                    "horizon_primary": primary,
-                    "horizon_all": all_matched,
-                    "horizon_log_days": HORIZON_LOG_DAYS[primary] if primary else None,
-                    "proj_mean": float(np.mean(seg_proj)) if seg_proj else None,
-                    "proj_last": float(seg_proj[-1]) if seg_proj else None,
-                    "pred_log_days_mean": float(np.mean(seg_pred)) if seg_pred else None,
-                    "ctrl_proj_mean": seg_ctrl.mean(axis=1).tolist() if seg_ctrl.size else None,
-                })
+                # 3. Sentence segment (over the WHOLE text — prompt + generation)
+                sentences = split_into_sentences(full)
+                sent_records = []
+                prompt_end = len(prompt)
+                anchor = prompt_spec.get("horizon")  # ground-truth label, if anchored
+                for si, (cs, ce, txt) in enumerate(sentences):
+                    t_lo, t_hi = tokens_in_span(offsets, cs, ce)
+                    if t_lo < 0:
+                        continue
+                    seg_proj = proj[t_lo:t_hi]
+                    seg_pred = pred[t_lo:t_hi]
+                    seg_ctrl = ctrl_proj[:, t_lo:t_hi]  # (K, seg_len)
+                    primary, all_matched = label_sentence(txt)
+                    # If the prompt is anchored to a horizon, every generated
+                    # sentence inherits it as ground truth (regex stays as
+                    # secondary label for diagnostics).
+                    label = anchor if anchor else primary
+                    sent_records.append({
+                        "idx": si,
+                        "text": txt,
+                        "char_range": [cs, ce],
+                        "tok_range": [t_lo, t_hi],
+                        "in_prompt": ce <= prompt_end,
+                        "horizon_primary": label,
+                        "horizon_regex": primary,
+                        "horizon_all": all_matched,
+                        "horizon_log_days": HORIZON_LOG_DAYS[label] if label else None,
+                        "label_source": "anchor" if anchor else ("regex" if primary else None),
+                        "proj_mean": float(np.mean(seg_proj)) if seg_proj else None,
+                        "proj_last": float(seg_proj[-1]) if seg_proj else None,
+                        "pred_log_days_mean": float(np.mean(seg_pred)) if seg_pred else None,
+                        "ctrl_proj_mean": seg_ctrl.mean(axis=1).tolist() if seg_ctrl.size else None,
+                    })
 
-            n_labeled = sum(1 for s in sent_records if s["horizon_primary"])
-            print(f"[traj]   tokens={len(proj)}  sentences={len(sent_records)}  "
-                  f"horizon-labeled={n_labeled}")
+                n_labeled = sum(1 for s in sent_records if s["horizon_primary"])
+                print(f"[traj]   tokens={len(proj)}  sentences={len(sent_records)}  "
+                      f"labeled={n_labeled}  anchor={anchor or '-'}")
 
-            record = {
-                "id": prompt_spec["id"],
-                "kind": prompt_spec["kind"],
-                "prompt": prompt,
-                "generation": generation,
-                "seed": args.seed,
-                "max_tokens": args.max_tokens,
-                "temperature": args.temp,
-                "top_p": args.top_p,
-                "layer": layer,
-                "w_norm": engine.continuous_w_norm,
-                "intercept": engine.continuous_intercept,
-                "tokens": traj["tokens"],
-                "token_offsets": offsets,
-                "projection": proj,
-                "predicted_log_days": pred,
-                "control_projection": ctrl_proj.tolist(),
-                "control_seed": args.control_seed,
-                "sentences": sent_records,
-            }
-            fout.write(json.dumps(record) + "\n")
-            fout.flush()
+                record = {
+                    "id": prompt_spec["id"],
+                    "kind": prompt_spec["kind"],
+                    "anchor_horizon": anchor,
+                    "prompt": prompt,
+                    "generation": generation,
+                    "seed": seed,
+                    "max_tokens": args.max_tokens,
+                    "temperature": args.temp,
+                    "top_p": args.top_p,
+                    "layer": layer,
+                    "w_norm": engine.continuous_w_norm,
+                    "intercept": engine.continuous_intercept,
+                    "tokens": traj["tokens"],
+                    "token_offsets": offsets,
+                    "projection": proj,
+                    "predicted_log_days": pred,
+                    "control_projection": ctrl_proj.tolist(),
+                    "control_seed": args.control_seed,
+                    "sentences": sent_records,
+                }
+                fout.write(json.dumps(record) + "\n")
+                fout.flush()
 
     print(f"\n[traj] done. wrote {out_path}")
 
@@ -293,7 +350,12 @@ def main():
     p.add_argument("--max-tokens", type=int, default=300)
     p.add_argument("--temp", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.9)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seeds", default="42",
+                   help="comma-separated seeds (e.g. 42,1337,7)")
+    p.add_argument("--prompts", default="anchored",
+                   choices=["regex", "anchored", "both"],
+                   help="prompt set: anchored (default, 30 horizon-anchored),"
+                        " regex (6 free/forced), or both")
     p.add_argument("--prompt-filter", default="",
                    help="only prompts whose id contains this substring")
     p.add_argument("--n-controls", type=int, default=8,

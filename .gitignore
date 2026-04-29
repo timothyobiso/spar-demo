@@ -24,6 +24,7 @@ slides/
 
 # Don't commit experiment battery raw outputs (large, easy to regenerate)
 results/stock_battery_*.jsonl
+results/probe_traj_*.jsonl
 # Don't commit basic figures or summary CSV (regenerate from JSONL)
 results/stock_battery_figs/*.png
 results/stock_battery_figs/*.csv
